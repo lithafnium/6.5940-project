@@ -2,9 +2,9 @@
 Written almost entirely by ChatGPT 3.5: https://chat.openai.com/share/4b60691d-3bb1-41ec-8e3b-54b00c976377
 '''
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QPushButton, QFileDialog, QLabel, QAction
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QPushButton, QFileDialog, QLabel, QProgressBar
 from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 import fitz  # PyMuPDF
 
 class PDFViewer(QMainWindow):
@@ -50,10 +50,9 @@ class PDFViewer(QMainWindow):
 
         if file_name:
             self.viewer_widget.load_pdf(file_name)
-
-        self.fullscreen = True
-        self.showFullScreen()
-        self.viewer_widget.fit_to_screen()
+            self.fullscreen = True
+            self.showFullScreen()
+            self.viewer_widget.fit_to_screen()
 
     def toggle_fullscreen(self):
         if self.fullscreen:
@@ -75,6 +74,9 @@ class PDFViewerWidget(QWidget):
 
         self.label = QLabel(self)
         self.layout.addWidget(self.label)
+
+        self.loading_bar = QProgressBar(self)
+        self.layout.addWidget(self.loading_bar)
 
     def load_pdf(self, file_path):
         self.doc = fitz.open(file_path)
@@ -116,5 +118,4 @@ class PDFViewerWidget(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = PDFViewer()
-    window.show()
     sys.exit(app.exec_())
