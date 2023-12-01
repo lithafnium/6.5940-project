@@ -1,3 +1,5 @@
 opencv_python
 numpy
 onnxruntime
+pymupdf
+PyQt5
