@@ -114,15 +114,17 @@ def pretty_print(x):
 
 
 if __name__ == "__main__":
-    from torchprofile import profile_macs
-    from thop import profile
+    # from torchprofile import profile_macs
+    # from thop import profile
     # (60, 60) (120, 120)
-    leye = torch.randn((1, 3, 60, 60)).cuda()
-    reye = torch.randn((1, 3, 60, 60)).cuda()
-    face = torch.randn((1, 3, 120, 120)).cuda()
+    leye = torch.randn((1, 3, 60, 60))
+    reye = torch.randn((1, 3, 60, 60))
+    face = torch.randn((1, 3, 120, 120))
     input = (leye, reye, face)
-    model = MyModelv7(arch="proxyless-w0.25-r112_imagenet").cuda()
-    macs = profile_macs(model, args=input)
-    _, params = profile(model, inputs=input, verbose=False)
-    print(pretty_print(macs), pretty_print(params))
-    print(model(*input))
+    model = MyModelv7(arch="proxyless-w0.25-r112_imagenet")
+    # macs = profile_macs(model, args=input)
+    # _, params = profile(model, inputs=input, verbose=False)
+    # print(pretty_print(macs), pretty_print(params))
+    # print(model(*input))
+
+    print(model)
