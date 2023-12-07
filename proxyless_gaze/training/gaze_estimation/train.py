@@ -30,9 +30,11 @@ def euler_to_vec(theta, phi):
     
 
 class TrainModel(pl.LightningModule):
-    def __init__(self, args):
+    def __init__(self, args, model=None):
         super(TrainModel, self).__init__()
-        if args.model == "MyModelv7":
+        if model is not None:
+            self.model = model
+        elif args.model == "MyModelv7":
             self.model = models.MyModelv7(arch=args.arch)
         elif args.model == 'MyModelv8':
             self.model = models.MyModelv8(arch=args.arch)
