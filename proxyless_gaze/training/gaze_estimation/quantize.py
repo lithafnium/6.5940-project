@@ -10,6 +10,7 @@ from collections import namedtuple
 from models import MyModelv7
 from tinynas.nn.networks import ProxylessNASNets, MobileInvertedResidualBlock
 from tinynas.nn.modules.layers import *
+from collections import OrderedDict
 
 # from train import TrainModel
 
@@ -93,6 +94,7 @@ class LinearQuantizer:
     def __init__(self, model: MyModelv7, bitwidth):
         self.model = model
         self.bitwidth = bitwidth
+        self.model_fused = None
     
     def linear_quantize(self, fp_tensor, bitwidth, scale, zero_point, dtype=torch.int8) -> torch.Tensor:
         assert(fp_tensor.dtype == torch.float)
@@ -178,7 +180,7 @@ class LinearQuantizer:
         assert(isinstance(input_zero_point, int))
         return quantized_bias - quantized_weight.sum((1,2,3)).to(torch.int32) * input_zero_point
 
-    def get_quantized_conv(self, input_activation, output_activation, conv_name, feature_bitwidth):
+    def get_quantized_conv(self, input_activation, output_activation, conv_name, relu_name, feature_bitwidth):
         weight_bitwidth = feature_bitwidth
         input_scale, input_zero_point = \
             self.get_quantization_scale_and_zero_point(
@@ -205,6 +207,77 @@ class LinearQuantizer:
             feature_bitwidth=feature_bitwidth, weight_bitwidth=weight_bitwidth
         )
 
+        return quantized_conv
+
+    def fuse_conv_bn(self, conv, bn):
+        # modified from https://mmcv.readthedocs.io/en/latest/_modules/mmcv/cnn/utils/fuse_conv_bn.html
+        assert conv.bias is None
+
+        factor = bn.weight.data / torch.sqrt(bn.running_var.data + bn.eps)
+        conv.weight.data = conv.weight.data * factor.reshape(-1, 1, 1, 1)
+        conv.bias = nn.Parameter(- bn.running_mean.data * factor + bn.bias.data)
+
+        return conv
+    
+    def fuse_layer(self, layer: ConvLayer):
+        conv = layer.conv
+        bn = layer.bn
+
+        new_conv = self.fuse_conv_bn(conv, bn)
+        layer.conv = new_conv
+        layer.bn = nn.Identity()
+    
+    def fuse_sequential(self, seq: nn.Sequential):
+
+        conv = seq.conv
+        bn = seq.bn
+        act = None
+        try: 
+            act = seq.act
+        except:
+            print("no act")
+
+        new_conv = self.fuse_conv_bn(conv, bn) 
+
+        if act is not None:
+            new_seq = nn.Sequential(OrderedDict([
+                ('conv', new_conv),
+                ('act', act)
+            ]))
+        else:
+            new_seq = nn.Sequential(OrderedDict([
+                ('conv', new_conv),
+            ]))
+        
+        return new_seq
+
+    def fuse_model(self):
+        model_fused = copy.deepcopy(self.model)
+        eye_channel = model_fused.eye_channel
+        attention_branch = model_fused.attention_branch
+        face_channel = model_fused.face_channel[0]
+
+        for i, backbone in enumerate([eye_channel, attention_branch, face_channel]):
+            assert isinstance(backbone, ProxylessNASNets)
+
+            self.fuse_layer(backbone.first_conv)
+            self.fuse_layer(backbone.feature_mix_layer)
+            blocks = []
+
+            for i, block in enumerate(backbone.blocks):
+                assert isinstance(block, MobileInvertedResidualBlock)
+                mic = block.mobile_inverted_conv
+                if isinstance(mic, ZeroLayer):
+                    continue
+
+                mic.depth_conv = self.fuse_sequential(mic.depth_conv)
+                mic.point_linear = self.fuse_sequential(mic.point_linear)
+
+                if mic.inverted_bottleneck:
+                    mic.inverted_bottleneck = self.fuse_sequential(mic.inverted_bottleneck)
+            
+        self.model_fused = model_fused
+        
     def quantize_model(self, name_list: [str], input_activations=None, output_activation=None):
         feature_bitwidth = self.bitwidth
 
@@ -214,9 +287,9 @@ class LinearQuantizer:
             
             return name
 
-        eye_channel = self.model.eye_channel
-        attention_branch = self.model.attention_branch
-        face_channel = self.model.face_channel[0]
+        eye_channel = self.model_fused.eye_channel
+        attention_branch = self.model_fused.attention_branch
+        face_channel = self.model_fused.face_channel[0]
         # eye_channel, attention_branch, _face_backbone 
         for i, backbone in enumerate([eye_channel, attention_branch, face_channel]):
             if i == 0: 
@@ -250,20 +323,24 @@ class LinearQuantizer:
 
                 # inverted_bottleneck = mic.inverted_bottleneck.conv
                 depth_conv = mic.depth_conv
-                dcn = add_name(name, [*add, "depth_conv", "conv"])
+                dcnc = add_name(name, [*add, "depth_conv", "conv"])
+                dncr = add_name(name, [*add, "depth_conv", "act"])
 
                 point_linear =  mic.point_linear
-                pln = add_name(name, [*add, "point_linear", "conv"])
+                plnc = add_name(name, [*add, "point_linear", "conv"])
+                plnr = add_name(name, [*add, "point_linear", "act"])
+
 
                 inverted_bottleneck = mic.inverted_bottleneck
-                ibn = add_name(name, [*add, "inverted_bottleneck", "conv"])
+                ibnc = add_name(name, [*add, "inverted_bottleneck", "conv"])
+                ibnr = add_name(name, [*add, "inverted_bottleneck", "act"])
 
 
                 # print(dcn, pln, ibn)
-                assert(dcn in name_list)
-                assert(pln in name_list)
-                if inverted_bottleneck is not None:
-                    assert(ibn in name_list)
+                # assert(dcn in name_list)
+                # assert(pln in name_list)
+                # if inverted_bottleneck is not None:
+                #     assert(ibn in name_list)
 
 
 
@@ -444,16 +521,16 @@ if __name__ == "__main__":
     # quantized_model_size = get_model_size(quantized_model, 8)
     # for m in model.named_parameters():
     #     print(m[0])
-    print(model)
 
     conv = []
     for name, m in model.named_modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU)):
-            print(name if isinstance(m, nn.Linear) else "")
-            conv.append(name)
+        if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU, nn.ReLU6)):
+            print(name)
 
     # print(conv)
-    # l = LinearQuantizer(model, 8)
+    l = LinearQuantizer(model, 8)
+    l.fuse_model()
+    print(l.model_fused)
     # l.quantize_model(name_list=conv)
     # children = get_children(model)
 
