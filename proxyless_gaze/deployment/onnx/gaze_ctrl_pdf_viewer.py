@@ -256,9 +256,6 @@ def visualize(img, face=None, landmark=None, gaze_pitchyaw=None, headpose=None):
             cv2.circle(img, (x, y), 2, (255, 0, 0), thickness=-1)
     if gaze_pitchyaw is not None:
         eye_pos = landmark[-2:].mean(0)
-        print(f'eye_pos:', eye_pos)
-        print(f'gaze_pitchyaw: {gaze_pitchyaw}')
-        print()
         draw_gaze(img, eye_pos, gaze_pitchyaw, 300, 4)
     if headpose is not None:
         rvec = headpose[0]
@@ -306,7 +303,21 @@ if __name__ == "__main__":
     x1, y1, x2, y2 = face[:4]
     face = np.array([x1,y1,x2,y2,face[-1]])
     landmark, landmark_on_cropped, cropped = detect_landmark(frame, face, landmark_detection_session)
-    TR_gaze_pitchyaw, rvec, tvec = estimate_gaze(frame, landmark, gaze_estimation_session)
+    TR_gaze_pitchyaw, _, _ = estimate_gaze(frame, landmark, gaze_estimation_session)
+
+    print('look at top left corner in 3..')
+    time.sleep(1)
+    print('2...')
+    time.sleep(1)
+    print('1...')
+    time.sleep(1)
+    ret, frame = cap.read()
+    faces = detect_face(frame, face_detection_session)
+    face = faces[0]
+    x1, y1, x2, y2 = face[:4]
+    face = np.array([x1,y1,x2,y2,face[-1]])
+    landmark, landmark_on_cropped, cropped = detect_landmark(frame, face, landmark_detection_session)
+    TL_gaze_pitchyaw, _, _ = estimate_gaze(frame, landmark, gaze_estimation_session)
 
     app = QApplication(sys.argv)
     window = PDFViewer()
@@ -314,7 +325,8 @@ if __name__ == "__main__":
     window.open_pdf()
 
     cnt = 0
-    topright_timestamp = timer.get_current_timestamp()
+    mode = None
+    gesture_timestamp = timer.get_current_timestamp()
     while True:
         if not window.viewer_widget.doc:
             print('no PDF open')
@@ -324,7 +336,7 @@ if __name__ == "__main__":
         if not ret or frame is None:
             break
         timer.start_record("whole_pipeline")
-        # show_frame = frame.copy()
+        show_frame = frame.copy()
         CURRENT_TIMESTAMP = timer.get_current_timestamp()
         cnt += 1
         if cnt % 2 == 1:
@@ -339,27 +351,56 @@ if __name__ == "__main__":
             gaze_pitchyaw, rvec, tvec = estimate_gaze(frame, landmark, gaze_estimation_session)
             gaze_pitchyaw = gaze_smoother(gaze_pitchyaw, t=CURRENT_TIMESTAMP)
             timer.start_record("visualize")
-            # show_frame = visualize(show_frame, face, landmark, gaze_pitchyaw, [rvec, tvec])
+            show_frame = visualize(show_frame, face, landmark, gaze_pitchyaw, [rvec, tvec])
             timer.end_record("visualize")
         timer.end_record("whole_pipeline")
 
         loading_bar = window.viewer_widget.loading_bar
-        GESTURE_THRESH = 2
-        if any(abs(gaze_pitchyaw[i] - TR_gaze_pitchyaw[i]) > 0.15 for i in range(2)):
-            # not looking at top right corner
+        GESTURE_THRESH = 0.5
+        topright = all(abs(gaze_pitchyaw[i] - TR_gaze_pitchyaw[i]) < 0.15 for i in range(2))
+        topleft = all(abs(gaze_pitchyaw[i] - TL_gaze_pitchyaw[i]) < 0.15 for i in range(2))
+        if topright and topleft:
+            print('TOPLEFT AND TOPRIGHT DETECTED. EXITING...')
+            break
+
+        if not (topleft or topright) or (topleft and mode != 'TOPLEFT') and (topright and mode != 'TOPRIGHT'):
+            # no gesture
             loading_bar.setValue(0)
-            topright_timestamp = CURRENT_TIMESTAMP
+            gesture_timestamp = CURRENT_TIMESTAMP
         else:
-            gesture_time = CURRENT_TIMESTAMP - topright_timestamp
-            if gesture_time < GESTURE_THRESH:
-                loading_bar.setValue(int(gesture_time * 100 // GESTURE_THRESH))
-            else:
-                loading_bar.setValue(0)
-                print('GESTURE DETECTED.')
-                topright_timestamp = CURRENT_TIMESTAMP
-                window.viewer_widget.next_page()
-        # show_frame = timer.print_on_image(show_frame)
-        # cv2.imshow("onnx_demo", show_frame)
+            # gesture logic
+            if topright:
+                if mode == 'TOPRIGHT':
+                    gesture_time = CURRENT_TIMESTAMP - gesture_timestamp
+                    if gesture_time < GESTURE_THRESH:
+                        loading_bar.setValue(int(gesture_time * 100 // GESTURE_THRESH))
+                    else:
+                        loading_bar.setValue(0)
+                        print('GESTURE DETECTED: NEXT PAGE')
+                        gesture_timestamp = CURRENT_TIMESTAMP
+                        window.viewer_widget.next_page()
+                    # display
+                    cv2.putText(show_frame, f"TOPRIGHT", 
+                                (500, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                else:
+                    mode = 'TOPRIGHT'
+            if topleft:
+                if mode == 'TOPLEFT':
+                    gesture_time = CURRENT_TIMESTAMP - gesture_timestamp
+                    if gesture_time < GESTURE_THRESH:
+                        loading_bar.setValue(int(gesture_time * 100 // GESTURE_THRESH))
+                    else:
+                        loading_bar.setValue(0)
+                        print('GESTURE DETECTED: PREVIOUS PAGE')
+                        gesture_timestamp = CURRENT_TIMESTAMP
+                        window.viewer_widget.previous_page()
+                    # display
+                    cv2.putText(show_frame, f"TOPLEFT", 
+                                (500, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                else:
+                    mode = 'TOPLEFT'
+        show_frame = timer.print_on_image(show_frame)
+        cv2.imshow("onnx_demo", show_frame)
 
         code = cv2.waitKey(1)
         if code == 27:
