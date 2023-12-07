@@ -13,6 +13,7 @@ from tinynas.nn.modules.layers import *
 from collections import OrderedDict
 
 # from train import TrainModel
+from mpii_train import TrainModel
 
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
@@ -95,6 +96,7 @@ class LinearQuantizer:
         self.model = model
         self.bitwidth = bitwidth
         self.model_fused = None
+        self.quantized_model = None
     
     def linear_quantize(self, fp_tensor, bitwidth, scale, zero_point, dtype=torch.int8) -> torch.Tensor:
         assert(fp_tensor.dtype == torch.float)
@@ -118,7 +120,7 @@ class LinearQuantizer:
         quantized_tensor = shifted_tensor.clamp_(quantized_min, quantized_max)
         return quantized_tensor
 
-    def get_quantization_scale_and_zero_point(fp_tensor, bitwidth):
+    def get_quantization_scale_and_zero_point(self, fp_tensor, bitwidth):
         quantized_min, quantized_max = get_quantized_range(bitwidth)
         fp_max = fp_tensor.max().item()
         fp_min = fp_tensor.min().item()
@@ -180,24 +182,15 @@ class LinearQuantizer:
         assert(isinstance(input_zero_point, int))
         return quantized_bias - quantized_weight.sum((1,2,3)).to(torch.int32) * input_zero_point
 
-    def get_quantized_conv(self, input_activation, output_activation, conv_name, relu_name, feature_bitwidth):
+    def get_quantized_conv(self, input_activation, output_activation, conv_name, relu_name, feature_bitwidth, conv):
         weight_bitwidth = feature_bitwidth
-        input_scale, input_zero_point = \
-            self.get_quantization_scale_and_zero_point(
-                input_activation[conv_name], feature_bitwidth)
+        input_scale, input_zero_point = self.get_quantization_scale_and_zero_point(input_activation[conv_name], feature_bitwidth)
 
-        output_scale, output_zero_point = \
-            self.get_quantization_scale_and_zero_point(
-                output_activation[relu_name], feature_bitwidth)
+        output_scale, output_zero_point = self.get_quantization_scale_and_zero_point(output_activation[relu_name], feature_bitwidth)
 
-        quantized_weight, weight_scale, weight_zero_point = \
-            self.linear_quantize_weight_per_channel(conv.weight.data, weight_bitwidth)
-        quantized_bias, bias_scale, bias_zero_point = \
-            self.linear_quantize_bias_per_output_channel(
-                conv.bias.data, weight_scale, input_scale)
-        shifted_quantized_bias = \
-            self.shift_quantized_conv2d_bias(quantized_bias, quantized_weight,
-                                        input_zero_point)
+        quantized_weight, weight_scale, weight_zero_point = self.linear_quantize_weight_per_channel(conv.weight.data, weight_bitwidth)
+        quantized_bias, bias_scale, bias_zero_point = self.linear_quantize_bias_per_output_channel(conv.bias.data, weight_scale, input_scale)
+        shifted_quantized_bias = self.shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_point)
 
         quantized_conv = QuantizedConv2d(
             quantized_weight, shifted_quantized_bias,
@@ -225,7 +218,7 @@ class LinearQuantizer:
 
         new_conv = self.fuse_conv_bn(conv, bn)
         layer.conv = new_conv
-        layer.bn = nn.Identity()
+        del layer._modules["bn"]
     
     def fuse_sequential(self, seq: nn.Sequential):
 
@@ -235,7 +228,7 @@ class LinearQuantizer:
         try: 
             act = seq.act
         except:
-            print("no act")
+            pass
 
         new_conv = self.fuse_conv_bn(conv, bn) 
 
@@ -278,39 +271,49 @@ class LinearQuantizer:
             
         self.model_fused = model_fused
         
-    def quantize_model(self, name_list: [str], input_activations=None, output_activation=None):
+    def quantize_model(self, input_activation=None, output_activation=None):
         feature_bitwidth = self.bitwidth
 
+        model_fused_copy = copy.deepcopy(self.model_fused)
         def add_name(name, add):
             for i in add:
                 name += f".{i}"
             
             return name
 
-        eye_channel = self.model_fused.eye_channel
-        attention_branch = self.model_fused.attention_branch
-        face_channel = self.model_fused.face_channel[0]
+        eye_channel = model_fused_copy.eye_channel
+        attention_branch = model_fused_copy.attention_branch
+        face_channel = model_fused_copy.face_channel[0]
         # eye_channel, attention_branch, _face_backbone 
         for i, backbone in enumerate([eye_channel, attention_branch, face_channel]):
             if i == 0: 
+                print("eye channel")
                 name = "eye_channel"
             elif i == 1: 
+                print("attention_branch")
                 name = "attention_branch"
             else:
+                print("face channel")
                 name = "face_channel.0"
-
 
             assert isinstance(backbone, ProxylessNASNets)
             first_conv = backbone.first_conv
-            fcn = add_name(name, ["first_conv", "conv"])
+            fcnc = add_name(name, ["first_conv", "conv"])
+            fcnr = add_name(name, ["first_conv", "act"])
+
+            backbone.first_conv = self.get_quantized_conv(input_activation, output_activation, fcnc, fcnr, feature_bitwidth, first_conv.conv)
+
             blocks = backbone.blocks
             feature_mix_layer = backbone.feature_mix_layer
-            fmln = add_name(name, ["feature_mix_layer", "conv"])
+            fmlnc = add_name(name, ["feature_mix_layer", "conv"])
+            fmlnr = add_name(name, ["feature_mix_layer", "act"])
 
-            assert(fcn in name_list)
-            assert(fmln in name_list)
+            backbone.feature_mix_layer = self.get_quantized_conv(input_activation, output_activation, fmlnc, fmlnr, feature_bitwidth, feature_mix_layer.conv)
+            
             blocks_copy = []
+            print("============")
             for i, block in enumerate(blocks): 
+                print(f"Modifying block {i} of {len(blocks)}")
                 
                 assert isinstance(block, MobileInvertedResidualBlock)
                 block_copy = copy.copy(block)
@@ -324,27 +327,25 @@ class LinearQuantizer:
                 # inverted_bottleneck = mic.inverted_bottleneck.conv
                 depth_conv = mic.depth_conv
                 dcnc = add_name(name, [*add, "depth_conv", "conv"])
-                dncr = add_name(name, [*add, "depth_conv", "act"])
+                dcnr = add_name(name, [*add, "depth_conv", "act"])
 
                 point_linear =  mic.point_linear
                 plnc = add_name(name, [*add, "point_linear", "conv"])
                 plnr = add_name(name, [*add, "point_linear", "act"])
 
-
                 inverted_bottleneck = mic.inverted_bottleneck
                 ibnc = add_name(name, [*add, "inverted_bottleneck", "conv"])
                 ibnr = add_name(name, [*add, "inverted_bottleneck", "act"])
 
+                mic.depth_conv = self.get_quantized_conv(input_activation, output_activation, dcnc, dcnr, feature_bitwidth, depth_conv.conv)
+                mic.point_linear = self.get_quantized_conv(input_activation, output_activation, plnc, dcnr, feature_bitwidth, point_linear.conv)
 
-                # print(dcn, pln, ibn)
-                # assert(dcn in name_list)
-                # assert(pln in name_list)
-                # if inverted_bottleneck is not None:
-                #     assert(ibn in name_list)
-
+                if inverted_bottleneck is not None:
+                    mic.inverted_bottleneck = self.get_quantized_conv(input_activation, output_activation, ibnc, ibnr, feature_bitwidth, inverted_bottleneck.conv)
 
 
             # print(backbone)
+        self.quantized_model = model_fused_copy
         
 
 class QuantizedConv2d(nn.Module):
@@ -378,8 +379,12 @@ class QuantizedConv2d(nn.Module):
                         input_zero_point, output_zero_point,
                         input_scale, weight_scale, output_scale,
                         stride, padding, dilation, groups):
+        print("-----------")
         assert(len(padding) == 4)
-        assert(input.dtype == torch.int8)
+        print(weight.dtype, input.dtype)
+        print(bias.dtype if bias is not None else "")
+
+
         assert(weight.dtype == input.dtype)
         assert(bias is None or bias.dtype == torch.int32)
         assert(isinstance(input_zero_point, int))
@@ -390,6 +395,8 @@ class QuantizedConv2d(nn.Module):
 
         # Step 1: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
         input = torch.nn.functional.pad(input, padding, 'constant', input_zero_point)
+        print("input size: ", input.shape)
+        print("weight size: ", weight.shape)
         if 'cpu' in input.device.type:
             # use 32-b MAC for simplicity
             output = torch.nn.functional.conv2d(input.to(torch.int32), weight.to(torch.int32), None, stride, 0, dilation, groups)
@@ -406,6 +413,7 @@ class QuantizedConv2d(nn.Module):
 
         # Make sure all value lies in the bitwidth-bit range
         output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(torch.int8)
+        print("output size: ", output.shape)
         return output
 
     def forward(self, x):
@@ -508,70 +516,119 @@ def get_model_size(model: nn.Module, data_width=32):
         num_elements += param.numel()
     return num_elements * data_width
 
-if __name__ == "__main__": 
-    model = MyModelv7(arch="proxyless-w0.3-r176_imagenet")
+def get_activations(args, model):
+    trainmodel = TrainModel(args=args, model=model)
+    train_dataloader = trainmodel.train_dataloader()
+    print(train_dataloader)
+    input_activation = {}
+    output_activation = {}
 
+    def add_range_recoder_hook(model):
+        import functools
+        def _record_range(self, x, y, module_name):
+            x = x[0]
+            input_activation[module_name] = x.detach()
+            output_activation[module_name] = y.detach()
+
+        all_hooks = []
+        for name, m in model.named_modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU, nn.ReLU6)):
+                all_hooks.append(m.register_forward_hook(
+                    functools.partial(_record_range, module_name=name)))
+        return all_hooks
+
+    hooks = add_range_recoder_hook(model)
+    sample_data = iter(train_dataloader).__next__()
+    left, right, face, gaze = sample_data
+    print(left.shape, right.shape, face.shape)
+    left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3])
+    right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3])
+    face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3])
+
+    model(left.cuda(), right.cuda(), face.cuda())
+
+    # # remove hooks
+    for h in hooks:
+        h.remove()
+    
+    return input_activation, output_activation
+if __name__ == "__main__": 
+    model = MyModelv7(arch="proxyless-w0.3-r176_imagenet").cuda()
+    print(model)
 
     # print(model.face_channel[0].blocks[2].mobile_inverted_conv.depth_conv.conv)
     # print(model.face_channel[0].blocks[17].mobile_inverted_conv)
     # print(model.face_channel[2])
-    # quantized_model = copy.deepcopy(model)
+    quantized_model = copy.deepcopy(model)
     # model_size = get_model_size(model)
-    # km = KMeansQuantizer(model=quantized_model, bitwidth=8)
+    km = KMeansQuantizer(model=quantized_model, bitwidth=8)
     # quantized_model_size = get_model_size(quantized_model, 8)
     # for m in model.named_parameters():
     #     print(m[0])
 
-    conv = []
-    for name, m in model.named_modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU, nn.ReLU6)):
-            print(name)
+    # conv = []
+    # for name, m in model.named_modules():
+    #     if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU, nn.ReLU6)):
+    #         print(name)
 
     # print(conv)
-    l = LinearQuantizer(model, 8)
-    l.fuse_model()
-    print(l.model_fused)
+    # print("fusing model...")
+    # l = LinearQuantizer(model, 8)
+    # l.fuse_model()
+    # print(l.model_fused)
+    # l.quantize_model()
     # l.quantize_model(name_list=conv)
     # children = get_children(model)
 
-    # pl.seed_everything(47)
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument('--config', required=False, type=str, default="./configs/config.yaml")
-    # parser.add_argument('--resume', action="store_true", dest="resume")
-    # args = parser.parse_args()
+    pl.seed_everything(47)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', required=False, type=str, default="./configs/config.yaml")
+    args = parser.parse_args()
 
-    # with open(args.config) as f:
-    #     yaml_args = yaml.load(f, Loader=yaml.FullLoader)
-    # yaml_args.update(vars(args))
-    # args = argparse.Namespace(**yaml_args)
+    with open(args.config) as f:
+        yaml_args = yaml.load(f, Loader=yaml.FullLoader)
+    yaml_args.update(vars(args))
+    args = argparse.Namespace(**yaml_args)
 
-    # trainmodel = TrainModel(args)
-    # train_dataloader = trainmodel.train_dataloader
+    print("getting activations...")
+    # input_activation, output_activation = get_activations(args, l.model_fused.cuda())
+    # print(input_activation.keys())
+    # print(output_activation.keys())
+    print("quantizing model...")
+    # l.quantize_model(input_activation, output_activation)
 
-    # input_activation = {}
-    # output_activation = {}
+    # print(l.quantized_model)
 
-    # def add_range_recoder_hook(model):
-    #     import functools
-    #     def _record_range(self, x, y, module_name):
-    #         x = x[0]
-    #         input_activation[module_name] = x.detach()
-    #         output_activation[module_name] = y.detach()
+    # model = TrainModel(args, model=l.quantized_model)
+    model = TrainModel(args=args, model=quantized_model, kmeans_quantizer=km)
+    mylogger = WandbLogger(project=args.project, 
+                                log_model=False, 
+                                name=args.run_name,
+                                id=args.run_name)
+    mylogger.log_hyperparams(args)
+    mylogger.watch(model, None, 10000, log_graph=False)
 
-    #     all_hooks = []
-    #     for name, m in model.named_modules():
-    #         if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU)):
-    #             all_hooks.append(m.register_forward_hook(
-    #                 functools.partial(_record_range, module_name=name)))
-    #     return all_hooks
+    checkpoint_callback = ModelCheckpoint(dirpath=args.ckpt_dir,
+                                        filename='{epoch}-{val_loss:.4f}-{val_angle_error:.2f}',
+                                        monitor='val_angle_error',
+                                        save_last=True,
+                                        save_top_k=3,
+                                        verbose=False)
+    
 
-    # hooks = add_range_recoder_hook(model)
-    # sample_data = iter(train_dataloader).__next__()[0]
-    # model(sample_data.cuda())
-
-    # # remove hooks
-    # for h in hooks:
-    #     h.remove()
+    print("Starting training...")
+    trainer = Trainer(default_root_dir=args.ckpt_dir,
+                    devices=1,
+                    precision=32,
+                    callbacks=[checkpoint_callback],
+                    max_epochs=args.epoch,
+                    benchmark=True,
+                    strategy="ddp_find_unused_parameters_true",
+                    logger=mylogger
+                    )
+    trainer.fit(model)
+    trainer.validate(model)
+    
     # for k, v in model.state_dict().items():
     #     print(k)
     # print(f"Original size: {model_size}")

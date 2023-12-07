@@ -82,7 +82,9 @@ class MyModelv7(nn.Module):
             nn.Linear(64, 2))
 
     def forward(self, leye, reye, face):
+        print("leye")
         left_eye_feature = self.eye_channel(leye)
+        print("reye")
         right_eye_feature = self.eye_channel(reye)
         left_eye_feature = self.leye_fc(left_eye_feature)
         right_eye_feature = self.reye_fc(right_eye_feature)

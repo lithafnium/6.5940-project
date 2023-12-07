@@ -4,6 +4,7 @@
 
 import json
 
+import torch
 import torch.nn as nn
 from torch.nn.modules.pooling import AdaptiveAvgPool2d
 from ..modules import *
@@ -83,11 +84,14 @@ class ProxylessNASNets(MyNetwork):
 
     def forward(self, x):
         x = self.first_conv(x)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            # print(i, "block: ", block)
             x = block(x)
         if self.feature_mix_layer is not None:
             x = self.feature_mix_layer(x)
+        # x = x.float().mean(3).mean(2).to(torch.int8)
         x = x.mean(3).mean(2)
+
         return x
 
     @property
