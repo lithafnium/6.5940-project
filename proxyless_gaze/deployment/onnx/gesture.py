@@ -254,9 +254,6 @@ def visualize(img, face=None, landmark=None, gaze_pitchyaw=None, headpose=None):
             cv2.circle(img, (x, y), 2, (255, 0, 0), thickness=-1)
     if gaze_pitchyaw is not None:
         eye_pos = landmark[-2:].mean(0)
-        print(f'eye_pos:', eye_pos)
-        print(f'gaze_pitchyaw: {gaze_pitchyaw}')
-        print()
         draw_gaze(img, eye_pos, gaze_pitchyaw, 300, 4)
     if headpose is not None:
         rvec = headpose[0]
