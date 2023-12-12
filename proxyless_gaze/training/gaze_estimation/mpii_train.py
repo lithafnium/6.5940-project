@@ -68,9 +68,9 @@ class TrainModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         left, right, face, label = batch
 
-        left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3])
-        right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3])
-        face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3])
+        left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3]).cuda()
+        right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3]).cuda()
+        face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3]).cuda()
 
         # left = extra_preprocess(left)
         # right = extra_preprocess(right)
@@ -87,9 +87,9 @@ class TrainModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         left, right, face, label = batch
         
-        left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3])
-        right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3])
-        face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3])
+        left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3]).cuda()
+        right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3]).cuda()
+        face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3]).cuda()
 
         # left = extra_preprocess(left)
         # right = extra_preprocess(right)

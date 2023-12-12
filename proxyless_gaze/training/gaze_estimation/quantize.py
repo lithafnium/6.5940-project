@@ -3,10 +3,11 @@ import torch
 import copy
 import argparse
 import yaml
+import wandb
 
 from fast_pytorch_kmeans import KMeans
 from collections import namedtuple
-
+import numpy as np
 from models import MyModelv7
 from tinynas.nn.networks import ProxylessNASNets, MobileInvertedResidualBlock
 from tinynas.nn.modules.layers import *
@@ -14,12 +15,14 @@ from collections import OrderedDict
 
 # from train import TrainModel
 from mpii_train import TrainModel
+from torch.utils.data import DataLoader
+from dataloader import MPIIGazeDataset
 
+from tqdm import tqdm 
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.strategies.ddp import DDPStrategy
 
 Codebook = namedtuple('Codebook', ['centroids', 'labels'])
 
@@ -182,6 +185,11 @@ class LinearQuantizer:
         assert(isinstance(input_zero_point, int))
         return quantized_bias - quantized_weight.sum((1,2,3)).to(torch.int32) * input_zero_point
 
+    def shift_quantized_linear_bias(self, quantized_bias, quantized_weight, input_zero_point):
+        assert(quantized_bias.dtype == torch.int32)
+        assert(isinstance(input_zero_point, int))
+        return quantized_bias - quantized_weight.sum(1).to(torch.int32) * input_zero_point
+
     def get_quantized_conv(self, input_activation, output_activation, conv_name, relu_name, feature_bitwidth, conv):
         weight_bitwidth = feature_bitwidth
         input_scale, input_zero_point = self.get_quantization_scale_and_zero_point(input_activation[conv_name], feature_bitwidth)
@@ -201,6 +209,24 @@ class LinearQuantizer:
         )
 
         return quantized_conv
+    
+    def get_quantized_linear(self, input_activation, output_activation, fc_name, relu_name, feature_bitwidth, fc):
+        weight_bitwidth = feature_bitwidth
+
+        input_scale, input_zero_point = self.get_quantization_scale_and_zero_point(input_activation[fc_name], feature_bitwidth)
+
+        output_scale, output_zero_point = self.get_quantization_scale_and_zero_point(output_activation[relu_name], feature_bitwidth)
+
+        quantized_weight, weight_scale, weight_zero_point = self.linear_quantize_weight_per_channel(fc.weight.data, weight_bitwidth)
+        quantized_bias, bias_scale, bias_zero_point = self.linear_quantize_bias_per_output_channel(fc.bias.data, weight_scale, input_scale)
+        shifted_quantized_bias = self.shift_quantized_linear_bias(quantized_bias, quantized_weight,input_zero_point)
+
+        return QuantizedLinear(
+            quantized_weight, shifted_quantized_bias,
+            input_zero_point, output_zero_point,
+            input_scale, weight_scale, output_scale,
+            feature_bitwidth=feature_bitwidth, weight_bitwidth=weight_bitwidth
+        )
 
     def fuse_conv_bn(self, conv, bn):
         # modified from https://mmcv.readthedocs.io/en/latest/_modules/mmcv/cnn/utils/fuse_conv_bn.html
@@ -283,9 +309,9 @@ class LinearQuantizer:
 
         eye_channel = model_fused_copy.eye_channel
         attention_branch = model_fused_copy.attention_branch
-        face_channel = model_fused_copy.face_channel[0]
+        face_channel_backbone = model_fused_copy.face_channel[0]
         # eye_channel, attention_branch, _face_backbone 
-        for i, backbone in enumerate([eye_channel, attention_branch, face_channel]):
+        for i, backbone in enumerate([eye_channel, attention_branch, face_channel_backbone]):
             if i == 0: 
                 print("eye channel")
                 name = "eye_channel"
@@ -309,7 +335,7 @@ class LinearQuantizer:
             fmlnr = add_name(name, ["feature_mix_layer", "act"])
 
             backbone.feature_mix_layer = self.get_quantized_conv(input_activation, output_activation, fmlnc, fmlnr, feature_bitwidth, feature_mix_layer.conv)
-            
+            backbone.quantized = True
             blocks_copy = []
             print("============")
             for i, block in enumerate(blocks): 
@@ -345,6 +371,36 @@ class LinearQuantizer:
 
 
             # print(backbone)
+        
+        face_channel = model_fused_copy.face_channel
+        face_channel_fc = face_channel[1] 
+        face_channel_fc.linear = self.get_quantized_linear(input_activation, output_activation, "face_channel.1.linear", "face_channel.1.relu", feature_bitwidth, face_channel_fc.linear)
+        del face_channel_fc.relu
+
+        leye_fc = model_fused_copy.leye_fc
+        leye_fc.linear = self.get_quantized_linear(input_activation, output_activation, "leye_fc.linear", "leye_fc.relu", feature_bitwidth, leye_fc.linear)
+        del leye_fc.relu
+
+        reye_fc = model_fused_copy.reye_fc
+        reye_fc.linear = self.get_quantized_linear(input_activation, output_activation, "reye_fc.linear", "reye_fc.relu", feature_bitwidth, reye_fc.linear)
+        del reye_fc.relu
+
+        leye_attention_fc = model_fused_copy.leye_attention_fc
+        reye_attention_fc = model_fused_copy.reye_attention_fc
+        leye_attention_fc[0] = self.get_quantized_linear(input_activation, output_activation, "leye_attention_fc.0", "leye_attention_fc.0", feature_bitwidth, leye_attention_fc[0])
+        reye_attention_fc[0] = self.get_quantized_linear(input_activation, output_activation, "reye_attention_fc.0", "reye_attention_fc.0", feature_bitwidth, reye_attention_fc[0])
+
+
+        regressor = model_fused_copy.regressor
+        regressor_copy = nn.Sequential(
+            self.get_quantized_linear(input_activation, output_activation, "regressor.0", "regressor.1", feature_bitwidth, regressor[0]),
+            self.get_quantized_linear(input_activation, output_activation, "regressor.2", "regressor.3", feature_bitwidth, regressor[2]),
+            self.get_quantized_linear(input_activation, output_activation, "regressor.4", "regressor.4", feature_bitwidth, regressor[4])
+        )
+        model_fused_copy.regressor = regressor_copy
+        # modify linear layers 
+        
+        
         self.quantized_model = model_fused_copy
         
 
@@ -541,6 +597,7 @@ def get_activations(args, model):
     sample_data = iter(train_dataloader).__next__()
     left, right, face, gaze = sample_data
     print(left.shape, right.shape, face.shape)
+    print(left.dtype, right.dtype, face.dtype)
     left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3])
     right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3])
     face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3])
@@ -552,33 +609,87 @@ def get_activations(args, model):
         h.remove()
     
     return input_activation, output_activation
+
+def extra_preprocess(x):
+    return (x * 255 - 128).clamp(-128, 127).to(torch.int8)
+
+def euler_to_vec(theta, phi):
+    x = -1 * np.cos(theta) * np.sin(phi)
+    y = -1 * np.sin(theta)
+    z = -1 * np.cos(theta) * np.cos(phi)
+    vec = np.array([x, y, z])
+    vec = vec / np.linalg.norm(vec)
+    return vec
+
+def calc_angle_error(preds, gts):
+    # in degree
+    preds = np.deg2rad(preds.detach().cpu())
+    gts = np.deg2rad(gts.detach().cpu())
+    errors = []
+    for pred, gt in zip(preds, gts):
+        pred_vec = euler_to_vec(pred[0], pred[1])
+        gt_vec = euler_to_vec(gt[0], gt[1])
+        error = np.rad2deg(np.arccos(np.clip(np.dot(pred_vec, gt_vec), -1.0, 1.0)))
+        errors.append(error)
+    return errors
+
+def log(field, value):
+    wandb.log(
+        {
+            field: value
+        }
+    )
+    pass
+
+def train(
+  model: nn.Module,
+  dataloader: DataLoader,
+  criterion: nn.Module,
+  optimizer,
+  epochs,
+  callbacks = None
+) -> None:
+  model.train()
+
+  for epoch in epochs:
+    print(f"Epoch {epoch} of {epochs}")
+    for batch_idx, batch in tqdm(enumerate(dataloader), desc='train', leave=False):
+        # Move the data from CPU to GPU
+        # inputs = inputs.cuda()
+        # targets = targets.cuda()
+        left, right, face, label = batch
+
+        left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3]).cuda()
+        right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3]).cuda()
+        face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3]).cuda()
+
+        left = extra_preprocess(left)
+        right = extra_preprocess(right)
+        face = extra_preprocess(face)
+
+        # Reset the gradients (from the last iteration)
+        optimizer.zero_grad()
+
+        # Forward inference
+        outputs = model(left, right, face)
+        loss = criterion(outputs, label)
+
+        # Backward propagation
+        loss.backward()
+
+        # Update optimizer and LR scheduler
+        optimizer.step()
+
+        if batch_idx % 100 == 0:
+            angle_error = np.mean(calc_angle_error(outputs, label))
+            log("train_angle_error", angle_error)
+        log("train_loss", loss)
+    
+
+
 if __name__ == "__main__": 
+    print("loading model...")
     model = MyModelv7(arch="proxyless-w0.3-r176_imagenet").cuda()
-    print(model)
-
-    # print(model.face_channel[0].blocks[2].mobile_inverted_conv.depth_conv.conv)
-    # print(model.face_channel[0].blocks[17].mobile_inverted_conv)
-    # print(model.face_channel[2])
-    quantized_model = copy.deepcopy(model)
-    # model_size = get_model_size(model)
-    km = KMeansQuantizer(model=quantized_model, bitwidth=8)
-    # quantized_model_size = get_model_size(quantized_model, 8)
-    # for m in model.named_parameters():
-    #     print(m[0])
-
-    # conv = []
-    # for name, m in model.named_modules():
-    #     if isinstance(m, (nn.Conv2d, nn.Linear, nn.ReLU, nn.ReLU6)):
-    #         print(name)
-
-    # print(conv)
-    # print("fusing model...")
-    # l = LinearQuantizer(model, 8)
-    # l.fuse_model()
-    # print(l.model_fused)
-    # l.quantize_model()
-    # l.quantize_model(name_list=conv)
-    # children = get_children(model)
 
     pl.seed_everything(47)
     parser = argparse.ArgumentParser()
@@ -590,21 +701,14 @@ if __name__ == "__main__":
     yaml_args.update(vars(args))
     args = argparse.Namespace(**yaml_args)
 
-    print("getting activations...")
-    # input_activation, output_activation = get_activations(args, l.model_fused.cuda())
-    # print(input_activation.keys())
-    # print(output_activation.keys())
-    print("quantizing model...")
-    # l.quantize_model(input_activation, output_activation)
-
-    # print(l.quantized_model)
-
-    # model = TrainModel(args, model=l.quantized_model)
-    model = TrainModel(args=args, model=quantized_model, kmeans_quantizer=km)
-    mylogger = WandbLogger(project=args.project, 
+    model = TrainModel(args, model=model)
+    
+    # model = TrainModel(args=args, model=quantized_model, kmeans_quantizer=km)
+    mylogger = WandbLogger(project=str(args.project), 
                                 log_model=False, 
-                                name=args.run_name,
-                                id=args.run_name)
+                                entity="6-5940"
+                                
+                               )
     mylogger.log_hyperparams(args)
     mylogger.watch(model, None, 10000, log_graph=False)
 
@@ -623,11 +727,50 @@ if __name__ == "__main__":
                     callbacks=[checkpoint_callback],
                     max_epochs=args.epoch,
                     benchmark=True,
-                    strategy="ddp_find_unused_parameters_true",
                     logger=mylogger
                     )
     trainer.fit(model)
     trainer.validate(model)
+
+
+    conv = []
+    for name, m in model.named_modules():
+        if isinstance(m, (nn.Linear)):
+            print(name)
+
+    # print(conv)
+    # print("fusing model...")
+    l = LinearQuantizer(model, 8)
+    l.fuse_model()
+    print(l.model_fused)
+
+
+    print("getting activations...")
+    input_activation, output_activation = get_activations(args, l.model_fused.cuda())
+    # print(input_activation.keys())
+    # print(output_activation.keys())
+    print("quantizing model...")
+    l.quantize_model(input_activation, output_activation)
+
+    print(l.quantized_model)
+
+    # model = copy.deepcopy(l.quantized_model)
+
+    # optimizer = getattr(torch.optim, args.optimizer)(model.parameters(), **args.optimizer_parameters)
+    # trainset = MPIIGazeDataset(args.dataset_dir, is_train=True)
+    # trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    # criterion = getattr(torch.nn, args.criterion)()
+    # epochs = args.epoch
+
+    # print("Training model...")
+    # train(
+    #     model,
+    #     trainloader, 
+    #     criterion,
+    #     optimizer,
+    #     epochs
+    # )
+
     
     # for k, v in model.state_dict().items():
     #     print(k)

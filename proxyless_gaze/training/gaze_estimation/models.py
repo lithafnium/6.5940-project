@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn.modules.container import Sequential
 from mobilenetv2 import mobilenetv2
+from collections import OrderedDict
 
 pretrained_models = {
     # https://github.com/d-li14/mobilenetv2.pytorch
@@ -47,6 +48,26 @@ def _make_backbone(width_mult=None, last_in_channel=None, last_out_channel=None,
         _model.load_state_dict(ckpt['state_dict'], strict=False)
         return _model, config['classifier']['in_features']
 
+class FC(nn.Module):
+    def __init__(self, features, **kwargs):
+        super(FC, self).__init__()
+        self.dropout = nn.Dropout(0.2)
+        self.linear = nn.Linear(features, 256)
+        self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, feature):
+        if not hasattr(self, "relu"):
+            feature = feature.float()
+            x = self.dropout(feature)
+            x = x.to(torch.int8) 
+            x = self.linear(x)
+            return x
+
+        x = self.dropout(feature)
+        x = self.linear(x) 
+        x = self.relu(x) 
+        return x
+
 
 class MyModelv7(nn.Module):
     def __init__(self, arch, **kwargs):
@@ -57,17 +78,9 @@ class MyModelv7(nn.Module):
         _face_backbone, face_out_features = _make_backbone(arch=arch)
         self.face_channel = Sequential(
             _face_backbone,
-            nn.Dropout(0.2),
-            nn.Linear(face_out_features, 256),
-            nn.ReLU(inplace=True))  # add relu
-        self.leye_fc = Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(eye_out_features, 256),
-            nn.ReLU(inplace=True))
-        self.reye_fc = Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(eye_out_features, 256),
-            nn.ReLU(inplace=True))
+            FC(features=face_out_features))  # add relu
+        self.leye_fc = FC(features=eye_out_features)
+        self.reye_fc = FC(features=eye_out_features)
         self.leye_attention_fc = Sequential(
             nn.Linear(attention_out_features, 256),
             nn.Sigmoid())
@@ -82,11 +95,14 @@ class MyModelv7(nn.Module):
             nn.Linear(64, 2))
 
     def forward(self, leye, reye, face):
-        print("leye")
+        # print("leye")
         left_eye_feature = self.eye_channel(leye)
-        print("reye")
+        # print("reye")
         right_eye_feature = self.eye_channel(reye)
+        # print("lef: ", self.leye_fc)
+        # print(left_eye_feature.dtype)
         left_eye_feature = self.leye_fc(left_eye_feature)
+        # print("ref: ", self.reye_fc)
         right_eye_feature = self.reye_fc(right_eye_feature)
 
         left_eye_attention = self.attention_branch(leye)

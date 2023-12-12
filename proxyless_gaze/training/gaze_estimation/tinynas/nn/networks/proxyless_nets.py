@@ -75,12 +75,13 @@ class MobileInvertedResidualBlock(MyModule):
 
 class ProxylessNASNets(MyNetwork):
 
-    def __init__(self, first_conv, blocks, feature_mix_layer):
+    def __init__(self, first_conv, blocks, feature_mix_layer, quantized=False):
         super(ProxylessNASNets, self).__init__()
 
         self.first_conv = first_conv
         self.blocks = nn.ModuleList(blocks)
         self.feature_mix_layer = feature_mix_layer
+        self.quantized = quantized
 
     def forward(self, x):
         x = self.first_conv(x)
@@ -89,8 +90,11 @@ class ProxylessNASNets(MyNetwork):
             x = block(x)
         if self.feature_mix_layer is not None:
             x = self.feature_mix_layer(x)
-        # x = x.float().mean(3).mean(2).to(torch.int8)
-        x = x.mean(3).mean(2)
+        
+        if self.quantized:
+            x = x.float().mean(3).mean(2).to(torch.int8)
+        else:
+            x = x.mean(3).mean(2)
 
         return x
 
