@@ -1,4 +1,16 @@
-  
+# Partita: A Gaze-Controlled PDF Page Turner
+To run demo: clone this project, then from the project directory run:
+```
+cd proxylessgaze/deployment/onnx
+python -m venv .venv
+source .venv/Scripts/activate
+pip install -r requirements.txt
+python gaze_ctrl_pdf_viewer.py
+```
+Follow the calibration instructions, then open a PDF when prompted.
+Instructions may vary for setting up a [venv](https://docs.python.org/3/library/venv.html) (Python virtual environment).
+
+====
 # ProxylessNAS: Direct Neural Architecture Search on Target Task and Hardware [[arXiv]](https://arxiv.org/abs/1812.00332) [[Poster]](assets/ProxylessNAS_iclr_poster_final.pdf)
 ```bash
 @inproceedings{
