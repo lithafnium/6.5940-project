@@ -1,6 +1,6 @@
-from .proxyless_nets import ProxylessNASNets, MobileInvertedResidualBlock
-from ..modules import *
-from utils import make_divisible, val2list
+from training.gaze_estimation.tinynas.nn.networks.proxyless_nets import ProxylessNASNets, MobileInvertedResidualBlock
+from training.gaze_estimation.tinynas.nn.modules import *
+from training.gaze_estimation.utils import make_divisible, val2list
 
 __all__ = ['MobileNetV2']
 

@@ -1,8 +1,8 @@
 project: linear_quantized_gaze
 run_name: linear_quantized_gaze
 
-ckpt_dir: ./ckpts_linear_quantized
-dataset_dir: ./utils/mpii_preprocess/annotations.txt
+ckpt_dir: ./training/gaze_estimation/ckpts_linear_quantized
+dataset_dir: ./training/gaze_estimation/utils/mpii_preprocess/annotations.txt
 
 batch_size: 128
 num_workers: 8
@@ -16,4 +16,3 @@ optimizer_parameters:
 model: MyModelv7
 arch: proxyless-w0.3-r176_imagenet
 logger: wandb
-

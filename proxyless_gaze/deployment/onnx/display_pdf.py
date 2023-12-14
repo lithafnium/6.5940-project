@@ -60,7 +60,7 @@ class PDFViewer(QMainWindow):
         else:
             self.showFullScreen()
 
-        self.fullscreen = not self.fullscreen
+        self.fullscreen = False
 
 
 class PDFViewerWidget(QWidget):

@@ -5,7 +5,7 @@
 from collections import OrderedDict
 
 import torch.nn as nn
-from utils import MyModule, build_activation, get_same_padding, SEModule, ShuffleLayer
+from training.gaze_estimation.utils import MyModule, build_activation, get_same_padding, SEModule, ShuffleLayer
 
 __all__ = ['set_layer_from_config', 'My2DLayer', 'ConvLayer', 'DepthConvLayer', 'PoolingLayer', 'IdentityLayer',
            'LinearLayer', 'ZeroLayer', 'MBInvertedConvLayer']

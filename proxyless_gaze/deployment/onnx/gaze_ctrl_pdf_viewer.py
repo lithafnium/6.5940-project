@@ -1,15 +1,16 @@
 import sys
 from PyQt5.QtWidgets import QApplication
-from display_pdf import PDFViewer
 
 import numpy as np
 import cv2
 import onnxruntime
 import time
 import math
+import torch
+from deployment.onnx.demo_utils import multiclass_nms, demo_postprocess, Timer, draw_gaze
 
-from demo_utils import multiclass_nms, demo_postprocess, Timer, draw_gaze
-from smoother import GazeSmoother, LandmarkSmoother, OneEuroFilter
+
+from deployment.onnx.display_pdf import PDFViewer
 
 face_model = np.float32([
     [-63.833572,  63.223045,  41.1674  ], # RIGHT_EYEBROW_RIGHT,
@@ -147,7 +148,7 @@ def normalizeDataForInference(img, hr, ht):
              data.append(R)
     return data
 
-def detect_face(img, session, score_thr=0.5, input_shape=(160, 128)) -> np.ndarray:
+def detect_face(img, session, timer, score_thr=0.5, input_shape=(160, 128)) -> np.ndarray:
     img, ratio = yolox_preprocess(img, input_shape)
     ort_inputs = {session.get_inputs()[0].name: img[None, :, :, :]}
     timer.start_record("face_detection")
@@ -171,7 +172,7 @@ def detect_face(img, session, score_thr=0.5, input_shape=(160, 128)) -> np.ndarr
     else:
         return None
 
-def detect_landmark(img, face, session) -> np.ndarray:
+def detect_landmark(img, face, session, timer) -> np.ndarray:
     height, width = img.shape[:2]
     x1, y1, x2, y2 = map(int, face[:4])
     w = x2 - x1 + 1
@@ -215,7 +216,7 @@ def detect_landmark(img, face, session) -> np.ndarray:
     pre_landmark[:, 1] += y1
     return pre_landmark, landmark_on_cropped, cropped
 
-def estimate_gaze(img, landmark, session) -> np.ndarray:
+def estimate_gaze(img, landmark, session, timer, use_quantized=False) -> np.ndarray:
     timer.start_record("gaze_estimation_preprocess")
     rvec, tvec = estimateHeadPose(landmark)
     data = normalizeDataForInference(img, rvec, tvec)
@@ -228,12 +229,27 @@ def estimate_gaze(img, landmark, session) -> np.ndarray:
     leye_image = np.transpose(np.expand_dims(leye_image, 0), (0,3,1,2))
     reye_image = np.transpose(np.expand_dims(reye_image, 0), (0,3,1,2))
     face_image = np.transpose(np.expand_dims(face_image, 0), (0,3,1,2))
-
-    ort_inputs = {session.get_inputs()[0].name: leye_image,
-                  session.get_inputs()[1].name: reye_image,
-                  session.get_inputs()[2].name: face_image}
     timer.start_record("gaze_estimation")
-    pred_pitchyaw_aligned = session.run(None, ort_inputs)[0][0]
+
+    if not use_quantized:
+        ort_inputs = {session.get_inputs()[0].name: leye_image,
+                    session.get_inputs()[1].name: reye_image,
+                    session.get_inputs()[2].name: face_image}
+    
+
+        pred_pitchyaw_aligned = session.run(None, ort_inputs)[0][0]
+    else:
+        leye_image = torch.from_numpy(leye_image).to(torch.int16)
+        reye_image = torch.from_numpy(reye_image).to(torch.int16)
+        face_image = torch.from_numpy(face_image).to(torch.int16)
+
+        # print(leye_image)
+        # print(reye_image)
+        # print(face_image)
+        pred_pitchyaw_aligned = session(leye_image, reye_image, face_image)[0]
+        pred_pitchyaw_aligned = pred_pitchyaw_aligned.numpy()
+    
+    # print(pred_pitchyaw_aligned)
     timer.end_record("gaze_estimation")
     pred_pitchyaw_aligned = np.deg2rad(pred_pitchyaw_aligned).tolist()
     pred_vec_aligned = euler_to_vec(*pred_pitchyaw_aligned)
@@ -278,132 +294,3 @@ def visualize(img, face=None, landmark=None, gaze_pitchyaw=None, headpose=None):
         #     cv2.circle(img, tuple(pt.ravel()), 4, (0, 0, 255), thickness=-1)
         #     cv2.putText(img, f"{i}", tuple(pt.ravel()), font, 0.5, txt_color, thickness=1)
     return img
-
-if __name__ == "__main__":
-    face_detection_session = onnxruntime.InferenceSession("./models/face_detection.onnx")
-    landmark_detection_session = onnxruntime.InferenceSession("./models/landmark_detection.onnx")
-    gaze_estimation_session = onnxruntime.InferenceSession("./models/gaze_estimation.onnx")
-    
-    cap = cv2.VideoCapture(0)
-    timer = Timer()
-
-    gaze_smoother = GazeSmoother(OneEuroFilter, min_cutoff=0.01, beta=0.8)
-    landmark_smoother = LandmarkSmoother(OneEuroFilter, pt_num=98, min_cutoff=0.1, beta=1.0)
-    bbox_smoother = LandmarkSmoother(OneEuroFilter, pt_num=2, min_cutoff=0.0, beta=1.0)
-
-    print('look at top right corner in 3..')
-    time.sleep(1)
-    print('2...')
-    time.sleep(1)
-    print('1...')
-    time.sleep(1)
-    ret, frame = cap.read()
-    faces = detect_face(frame, face_detection_session)
-    face = faces[0]
-    x1, y1, x2, y2 = face[:4]
-    face = np.array([x1,y1,x2,y2,face[-1]])
-    landmark, landmark_on_cropped, cropped = detect_landmark(frame, face, landmark_detection_session)
-    TR_gaze_pitchyaw, _, _ = estimate_gaze(frame, landmark, gaze_estimation_session)
-
-    print('look at top left corner in 3..')
-    time.sleep(1)
-    print('2...')
-    time.sleep(1)
-    print('1...')
-    time.sleep(1)
-    ret, frame = cap.read()
-    faces = detect_face(frame, face_detection_session)
-    face = faces[0]
-    x1, y1, x2, y2 = face[:4]
-    face = np.array([x1,y1,x2,y2,face[-1]])
-    landmark, landmark_on_cropped, cropped = detect_landmark(frame, face, landmark_detection_session)
-    TL_gaze_pitchyaw, _, _ = estimate_gaze(frame, landmark, gaze_estimation_session)
-
-    app = QApplication(sys.argv)
-    window = PDFViewer()
-    window.show()
-    window.open_pdf()
-
-    cnt = 0
-    mode = None
-    gesture_timestamp = timer.get_current_timestamp()
-    while True:
-        if not window.viewer_widget.doc:
-            print('no PDF open')
-            time.sleep(1)
-            continue
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            break
-        timer.start_record("whole_pipeline")
-        show_frame = frame.copy()
-        CURRENT_TIMESTAMP = timer.get_current_timestamp()
-        cnt += 1
-        if cnt % 2 == 1:
-            faces = detect_face(frame, face_detection_session)
-        if faces is not None:
-            face = faces[0]
-            x1, y1, x2, y2 = face[:4]
-            [[x1,y1],[x2,y2]] = bbox_smoother([[x1,y1],[x2,y2]], t=CURRENT_TIMESTAMP)
-            face = np.array([x1,y1,x2,y2,face[-1]])
-            landmark, landmark_on_cropped, cropped = detect_landmark(frame, face, landmark_detection_session)
-            landmark = landmark_smoother(landmark, t=CURRENT_TIMESTAMP)
-            gaze_pitchyaw, rvec, tvec = estimate_gaze(frame, landmark, gaze_estimation_session)
-            gaze_pitchyaw = gaze_smoother(gaze_pitchyaw, t=CURRENT_TIMESTAMP)
-            timer.start_record("visualize")
-            show_frame = visualize(show_frame, face, landmark, gaze_pitchyaw, [rvec, tvec])
-            timer.end_record("visualize")
-        timer.end_record("whole_pipeline")
-
-        loading_bar = window.viewer_widget.loading_bar
-        GESTURE_THRESH = 0.5
-        topright = all(abs(gaze_pitchyaw[i] - TR_gaze_pitchyaw[i]) < 0.15 for i in range(2))
-        topleft = all(abs(gaze_pitchyaw[i] - TL_gaze_pitchyaw[i]) < 0.15 for i in range(2))
-        if topright and topleft:
-            print('TOPLEFT AND TOPRIGHT DETECTED. EXITING...')
-            break
-
-        if not (topleft or topright) or (topleft and mode != 'TOPLEFT') and (topright and mode != 'TOPRIGHT'):
-            # no gesture
-            loading_bar.setValue(0)
-            gesture_timestamp = CURRENT_TIMESTAMP
-        else:
-            # gesture logic
-            if topright:
-                if mode == 'TOPRIGHT':
-                    gesture_time = CURRENT_TIMESTAMP - gesture_timestamp
-                    if gesture_time < GESTURE_THRESH:
-                        loading_bar.setValue(int(gesture_time * 100 // GESTURE_THRESH))
-                    else:
-                        loading_bar.setValue(0)
-                        print('GESTURE DETECTED: NEXT PAGE')
-                        gesture_timestamp = CURRENT_TIMESTAMP
-                        window.viewer_widget.next_page()
-                    # display
-                    cv2.putText(show_frame, f"TOPRIGHT", 
-                                (500, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-                else:
-                    mode = 'TOPRIGHT'
-            if topleft:
-                if mode == 'TOPLEFT':
-                    gesture_time = CURRENT_TIMESTAMP - gesture_timestamp
-                    if gesture_time < GESTURE_THRESH:
-                        loading_bar.setValue(int(gesture_time * 100 // GESTURE_THRESH))
-                    else:
-                        loading_bar.setValue(0)
-                        print('GESTURE DETECTED: PREVIOUS PAGE')
-                        gesture_timestamp = CURRENT_TIMESTAMP
-                        window.viewer_widget.previous_page()
-                    # display
-                    cv2.putText(show_frame, f"TOPLEFT", 
-                                (500, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-                else:
-                    mode = 'TOPLEFT'
-        show_frame = timer.print_on_image(show_frame)
-        cv2.imshow("onnx_demo", show_frame)
-
-        code = cv2.waitKey(1)
-        if code == 27:
-            break
-
-    sys.exit(app.exec_())

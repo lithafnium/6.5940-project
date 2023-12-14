@@ -7,8 +7,8 @@ import json
 import torch
 import torch.nn as nn
 from torch.nn.modules.pooling import AdaptiveAvgPool2d
-from ..modules import *
-from utils import download_url, MyNetwork, MyModule
+from training.gaze_estimation.tinynas.nn.modules import *
+from training.gaze_estimation.utils import download_url, MyNetwork, MyModule
 
 __all__ = ['ProxylessNASNets', 'MobileInvertedResidualBlock']
 
@@ -92,7 +92,7 @@ class ProxylessNASNets(MyNetwork):
             x = self.feature_mix_layer(x)
         
         if self.quantized:
-            x = x.float().mean(3).mean(2).to(torch.int8)
+            x = x.float().mean(3).mean(2).to(torch.int16)
         else:
             x = x.mean(3).mean(2)
 

@@ -2,24 +2,24 @@ from turtle import left, right
 import torch
 import torch.nn as nn
 from torch.nn.modules.container import Sequential
-from mobilenetv2 import mobilenetv2
+from training.gaze_estimation.mobilenetv2 import mobilenetv2
 from collections import OrderedDict
 
 pretrained_models = {
     # https://github.com/d-li14/mobilenetv2.pytorch
-    'mbv2_1.00':  './pretrained/mobilenetv2_1.0-0c6065bc.pth',
-    'mbv2_0.75': './pretrained/mobilenetv2_0.75-dace9791.pth',
-    'mbv2_0.50':  './pretrained/mobilenetv2_0.5-eaa6f9ad.pth',
-    'mbv2_0.35': './pretrained/mobilenetv2_0.35-b2e15951.pth',
-    'mbv2_0.25': './pretrained/mobilenetv2_0.25-b61d2159.pth',
-    'mbv2_0.10':  './pretrained/mobilenetv2_0.1-7d1d638a.pth',
+    'mbv2_1.00':  './training/gaze_estimation/pretrained/mobilenetv2_1.0-0c6065bc.pth',
+    'mbv2_0.75': './training/gaze_estimation/pretrained/mobilenetv2_0.75-dace9791.pth',
+    'mbv2_0.50':  './training/gaze_estimation/pretrained/mobilenetv2_0.5-eaa6f9ad.pth',
+    'mbv2_0.35': './training/gaze_estimation/pretrained/mobilenetv2_0.35-b2e15951.pth',
+    'mbv2_0.25': './training/gaze_estimation/pretrained/mobilenetv2_0.25-b61d2159.pth',
+    'mbv2_0.10':  './training/gaze_estimation/pretrained/mobilenetv2_0.1-7d1d638a.pth',
 
     # https://github.com/mit-han-lab/tinyml/tree/master/mcunet
-    'mbv2-w0.35-r144_imagenet': './pretrained/mbv2-w0.35-r144_imagenet.pth',
-    'mcunet-320kb-1mb_imagenet': './pretrained/mcunet-320kb-1mb_imagenet.pth',
-    'mcunet-512kb-2mb_imagenet': './pretrained/mcunet-512kb-2mb_imagenet.pth',
-    'proxyless-w0.3-r176_imagenet': './pretrained/proxyless-w0.3-r176_imagenet.pth',
-    'proxyless-w0.25-r112_imagenet': './pretrained/proxyless-w0.25-r112_imagenet.pth'
+    'mbv2-w0.35-r144_imagenet': './training/gaze_estimation/pretrained/mbv2-w0.35-r144_imagenet.pth',
+    'mcunet-320kb-1mb_imagenet': './training/gaze_estimation/pretrained/mcunet-320kb-1mb_imagenet.pth',
+    'mcunet-512kb-2mb_imagenet': './training/gaze_estimation/pretrained/mcunet-512kb-2mb_imagenet.pth',
+    'proxyless-w0.3-r176_imagenet': './training/gaze_estimation/pretrained/proxyless-w0.3-r176_imagenet.pth',
+    'proxyless-w0.25-r112_imagenet': './training/gaze_estimation/pretrained/proxyless-w0.25-r112_imagenet.pth'
 }
 
 
@@ -38,7 +38,7 @@ def _make_backbone(width_mult=None, last_in_channel=None, last_out_channel=None,
             _mbv2.conv[1] = nn.BatchNorm2d(last_out_channel)
             return nn.Sequential(*[_mbv2.features, _mbv2.conv])
     else:
-        from tinynas.nn.networks import ProxylessNASNets
+        from training.gaze_estimation.tinynas.nn.networks import ProxylessNASNets
         import json
         json_file = pretrained_models[arch].replace('.pth', '.json')
         with open(json_file) as f:
@@ -59,7 +59,7 @@ class FC(nn.Module):
         if not hasattr(self, "relu"):
             feature = feature.float()
             x = self.dropout(feature)
-            x = x.to(torch.int8) 
+            x = x.to(torch.int16) 
             x = self.linear(x)
             return x
 

@@ -8,21 +8,18 @@ import wandb
 from fast_pytorch_kmeans import KMeans
 from collections import namedtuple
 import numpy as np
-from models import MyModelv7
-from tinynas.nn.networks import ProxylessNASNets, MobileInvertedResidualBlock
-from tinynas.nn.modules.layers import *
+from training.gaze_estimation.models import MyModelv7
+from training.gaze_estimation.tinynas.nn.networks import ProxylessNASNets, MobileInvertedResidualBlock
+from training.gaze_estimation.tinynas.nn.modules.layers import *
 from collections import OrderedDict
 
 # from train import TrainModel
 # from mpii_train import TrainModel
 from torch.utils.data import DataLoader
-from dataloader import MPIIGazeDataset
+from training.gaze_estimation.dataloader import MPIIGazeDataset
 
 from tqdm import tqdm 
 import pytorch_lightning as pl
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
 
 Codebook = namedtuple('Codebook', ['centroids', 'labels'])
 
@@ -103,8 +100,10 @@ class LinearQuantizer:
         self.bitwidth = bitwidth
         self.model_fused = None
         self.quantized_model = None
+
+        self.dtype = torch.int16
     
-    def linear_quantize(self, fp_tensor, bitwidth, scale, zero_point, dtype=torch.int8) -> torch.Tensor:
+    def linear_quantize(self, fp_tensor, bitwidth, scale, zero_point, dtype=torch.int16) -> torch.Tensor:
         assert(fp_tensor.dtype == torch.float)
         assert(isinstance(scale, float) or
             (scale.dtype == torch.float and scale.dim() == fp_tensor.dim()))
@@ -134,6 +133,8 @@ class LinearQuantizer:
         scale = (fp_max - fp_min)/ (quantized_max - quantized_min)
         zero_point = int(round(quantized_min - fp_min / scale))
 
+        print("zero point: ", zero_point)
+
         # clip the zero_point to fall in [quantized_min, quantized_max]
         if zero_point < quantized_min:
             zero_point = quantized_min
@@ -145,7 +146,7 @@ class LinearQuantizer:
 
     def linear_quantize_feature(self, fp_tensor, bitwidth):
         scale, zero_point = self.get_quantization_scale_and_zero_point(fp_tensor, bitwidth)
-        quantized_tensor = self.linear_quantize(fp_tensor, bitwidth, scale, zero_point)
+        quantized_tensor = self.linear_quantize(fp_tensor, bitwidth, scale, zero_point, dtype=self.dtype)
         return quantized_tensor, scale, zero_point
     
     def get_quantization_scale_for_weight(self, weight, bitwidth):
@@ -166,7 +167,7 @@ class LinearQuantizer:
         scale_shape = [1] * tensor.dim()
         scale_shape[dim_output_channels] = -1
         scale = scale.view(scale_shape)
-        quantized_tensor = self.linear_quantize(tensor, bitwidth, scale, zero_point=0)
+        quantized_tensor = self.linear_quantize(tensor, bitwidth, scale, zero_point=0, dtype=self.dtype)
         return quantized_tensor, scale, 0
 
     def linear_quantize_bias_per_output_channel(self, bias, weight_scale, input_scale):
@@ -208,6 +209,7 @@ class LinearQuantizer:
             input_zero_point, output_zero_point,
             input_scale, weight_scale, output_scale,
             conv.stride, conv.padding, conv.dilation, conv.groups,
+            dtype=self.dtype,
             feature_bitwidth=feature_bitwidth, weight_bitwidth=weight_bitwidth
         )
 
@@ -229,8 +231,10 @@ class LinearQuantizer:
             input_zero_point, output_zero_point,
             input_scale, weight_scale, output_scale,
             feature_bitwidth=feature_bitwidth, weight_bitwidth=weight_bitwidth,
+            dtype=self.dtype,
             fc_name=fc_name,
-            relu_name=relu_name
+            relu_name=relu_name,
+            
         )
 
     def fuse_conv_bn(self, conv, bn):
@@ -369,7 +373,7 @@ class LinearQuantizer:
                 ibnr = add_name(name, [*add, "inverted_bottleneck", "act"])
 
                 mic.depth_conv = self.get_quantized_conv(input_activation, output_activation, dcnc, dcnr, feature_bitwidth, depth_conv.conv)
-                mic.point_linear = self.get_quantized_conv(input_activation, output_activation, plnc, dcnr, feature_bitwidth, point_linear.conv)
+                mic.point_linear = self.get_quantized_conv(input_activation, output_activation, plnc, plnc, feature_bitwidth, point_linear.conv)
 
                 if inverted_bottleneck is not None:
                     mic.inverted_bottleneck = self.get_quantized_conv(input_activation, output_activation, ibnc, ibnr, feature_bitwidth, inverted_bottleneck.conv)
@@ -413,8 +417,8 @@ class QuantizedConv2d(nn.Module):
     def __init__(self, weight, bias,
                  input_zero_point, output_zero_point,
                  input_scale, weight_scale, output_scale,
-                 stride, padding, dilation, groups,
-                 feature_bitwidth=8, weight_bitwidth=8):
+                 stride, padding, dilation, groups, dtype=torch.int16,
+                 feature_bitwidth=16, weight_bitwidth=16):
         super().__init__()
         # current version Pytorch does not support IntTensor as nn.Parameter
         self.register_buffer('weight', weight)
@@ -434,6 +438,8 @@ class QuantizedConv2d(nn.Module):
 
         self.feature_bitwidth = feature_bitwidth
         self.weight_bitwidth = weight_bitwidth
+
+        self.dtype = dtype
 
 
     def quantized_conv2d(self, input, weight, bias, feature_bitwidth, weight_bitwidth,
@@ -473,7 +479,7 @@ class QuantizedConv2d(nn.Module):
         output = output + output_zero_point
 
         # Make sure all value lies in the bitwidth-bit range
-        output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(torch.int8)
+        output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(self.dtype)
         # print("output size: ", output.shape)
         return output
 
@@ -490,7 +496,7 @@ class QuantizedLinear(nn.Module):
     def __init__(self, weight, bias,
                  input_zero_point, output_zero_point,
                  input_scale, weight_scale, output_scale,
-                 feature_bitwidth=8, weight_bitwidth=8, fc_name="", relu_name=""):
+                 feature_bitwidth=16, weight_bitwidth=16, fc_name="", relu_name="", dtype=torch.int16):
         super().__init__()
         # current version Pytorch does not support IntTensor as nn.Parameter
         self.register_buffer('weight', weight)
@@ -508,6 +514,8 @@ class QuantizedLinear(nn.Module):
 
         self.feature_bitwidth = feature_bitwidth
         self.weight_bitwidth = weight_bitwidth
+
+        self.dtype = dtype
     
     def quantized_linear(self, input, weight, bias, feature_bitwidth, weight_bitwidth,
                      input_zero_point, output_zero_point,
@@ -516,7 +524,7 @@ class QuantizedLinear(nn.Module):
         # print("LINEAR")
         # print("input dtype: ", input.dtype, "weight dtype: ", weight.dtype)
         # print(self.fc_name, self.relu_name)
-        assert(input.dtype == torch.int8)
+        assert(input.dtype == self.dtype)
         assert(weight.dtype == input.dtype)
         assert(bias is None or bias.dtype == torch.int32)
         assert(isinstance(input_zero_point, int))
@@ -546,7 +554,7 @@ class QuantizedLinear(nn.Module):
         ############### YOUR CODE ENDS HERE #################
 
         # Make sure all value lies in the bitwidth-bit range
-        output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(torch.int8)
+        output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(self.dtype)
         return output
 
     def forward(self, x):
@@ -621,9 +629,6 @@ def get_activations(args, model):
     
     return input_activation, output_activation
 
-def extra_preprocess(x):
-    return (x * 255 - 128).clamp(-128, 127).to(torch.int8)
-
 def euler_to_vec(theta, phi):
     x = -1 * np.cos(theta) * np.sin(phi)
     y = -1 * np.sin(theta)
@@ -644,79 +649,14 @@ def calc_angle_error(preds, gts):
         errors.append(error)
     return errors
 
-def log(field, value):
-    wandb.log(
-        {
-            field: value
-        }
-    )
-    pass
-
-def train(
-  model: nn.Module,
-  dataloader: DataLoader,
-  criterion: nn.Module,
-  optimizer,
-  epochs,
-  callbacks = None
-) -> None:
-  model.train()
-
-  for epoch in epochs:
-    print(f"Epoch {epoch} of {epochs}")
-    for batch_idx, batch in tqdm(enumerate(dataloader), desc='train', leave=False):
-        # Move the data from CPU to GPU
-        # inputs = inputs.cuda()
-        # targets = targets.cuda()
-        left, right, face, label = batch
-
-        left = left.expand(left.shape[0], 3, left.shape[2], left.shape[3]).cuda()
-        right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3]).cuda()
-        face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3]).cuda()
-
-        left = extra_preprocess(left)
-        right = extra_preprocess(right)
-        face = extra_preprocess(face)
-
-        # Reset the gradients (from the last iteration)
-        optimizer.zero_grad()
-
-        # Forward inference
-        outputs = model(left, right, face)
-        loss = criterion(outputs, label)
-
-        # Backward propagation
-        loss.backward()
-
-        # Update optimizer and LR scheduler
-        optimizer.step()
-
-        if batch_idx % 100 == 0:
-            angle_error = np.mean(calc_angle_error(outputs, label))
-            log("train_angle_error", angle_error)
-        log("train_loss", loss)
-    
-
-
-
-if __name__ == "__main__": 
-
+def quantize_linear(config_path):
     pl.seed_everything(47)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', required=False, type=str, default="./configs/config.yaml")
-    parser.add_argument('--onnx_model', default="./linear_output/gaze.onnx")
-    parser.add_argument('--onnx_model_sim',
-                        help='Output ONNX model',
-                        default="./linear_output/gaze-sim.onnx")
-    args = parser.parse_args()
-
-    with open(args.config) as f:
+    with open(config_path) as f:
         yaml_args = yaml.load(f, Loader=yaml.FullLoader)
-    yaml_args.update(vars(args))
     args = argparse.Namespace(**yaml_args)
 #     print("loading model...")
     model = MyModelv7(arch="proxyless-w0.3-r176_imagenet")
-    checkpoint = torch.load("./ckpts_linear_quantized/last.ckpt", map_location=torch.device('cpu'))
+    checkpoint = torch.load("./training/gaze_estimation/ckpts_linear_quantized/last.ckpt", map_location=torch.device('cpu'))
     state_dict = copy.deepcopy(checkpoint['state_dict'])
     checkpoint = {}
     for key in state_dict:
@@ -724,10 +664,9 @@ if __name__ == "__main__":
             checkpoint[key.replace("model.", "")] = state_dict[key]
     model.load_state_dict(checkpoint)
 
-    l = LinearQuantizer(model, 8)
+    l = LinearQuantizer(model, 16)
     l.fuse_model()
     print(l.model_fused)
-
 
     print("getting activations...")
     input_activation, output_activation = get_activations(args, l.model_fused)
@@ -735,26 +674,7 @@ if __name__ == "__main__":
     print("quantizing model...")
     l.quantize_model(input_activation, output_activation)
 
-    print(l.quantized_model)
-
-    leye = torch.randn((1, 3, 60, 60))
-    reye = torch.randn((1, 3, 60, 60))
-    face = torch.randn((1, 3, 120, 120))
-
-    leye = extra_preprocess(leye)
-    reye = extra_preprocess(reye)
-    face = extra_preprocess(face)
-    dummy_input = (leye, reye, face)
-    input_names = ["left_eye", "right_eye", "face"]
-    output_names = ["gaze_pitchyaw"]
-
-    print("exporting to onnx...")
-    torch.onnx.export(l.quantized_model,
-                  dummy_input,
-                  args.onnx_model,
-                  verbose=False,
-                  input_names=input_names,
-                  output_names=output_names)
+    return l.quantized_model
 
 
 
@@ -824,3 +744,7 @@ if __name__ == "__main__":
     #     print(k)
     # print(f"Original size: {model_size}")
     # print(f"Quantized Model Size: {quantized_model_size}")
+
+# if __name__ == "__main__": 
+
+    

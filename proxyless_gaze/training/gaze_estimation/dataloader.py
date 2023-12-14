@@ -5,7 +5,7 @@ from torchvision import transforms
 from PIL import Image
 import os.path as osp
 import numpy as np
-from utils.normalize_data import normalizeData
+from training.gaze_estimation.utils.normalize_data import normalizeData
 import cv2
 import scipy.io as sio
 import glob
