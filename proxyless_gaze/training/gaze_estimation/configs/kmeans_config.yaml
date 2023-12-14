@@ -1,7 +1,7 @@
-project: linear_quantized_gaze
-run_name: linear_quantized_gaze
+project: gaze_mpiigaze
+run_name: gaze_mpiigaze
 
-ckpt_dir: ./ckpts_linear_quantized
+ckpt_dir: ./ckpts_kmeans
 dataset_dir: ./utils/mpii_preprocess/annotations.txt
 
 batch_size: 128
@@ -11,7 +11,7 @@ criterion: MSELoss
 
 optimizer: Adam
 optimizer_parameters:
-  lr: 0.001
+  lr: 0.0005
 
 model: MyModelv7
 arch: proxyless-w0.3-r176_imagenet

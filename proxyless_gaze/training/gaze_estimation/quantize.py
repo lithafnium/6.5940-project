@@ -14,7 +14,7 @@ from tinynas.nn.modules.layers import *
 from collections import OrderedDict
 
 # from train import TrainModel
-from mpii_train import TrainModel
+# from mpii_train import TrainModel
 from torch.utils.data import DataLoader
 from dataloader import MPIIGazeDataset
 
@@ -28,7 +28,8 @@ Codebook = namedtuple('Codebook', ['centroids', 'labels'])
 
 class KMeansQuantizer:
     def __init__(self, model : nn.Module, bitwidth=4):
-        self.codebook = self.quantize(model, bitwidth)
+        model_copy = copy.deepcopy(model)
+        self.codebook = self.quantize(model_copy, bitwidth)
 
     def update_codebook(self, fp32_tensor: torch.Tensor, codebook: Codebook):
         """
@@ -36,6 +37,7 @@ class KMeansQuantizer:
         :param fp32_tensor: [torch.(cuda.)Tensor]
         :param codebook: [Codebook] (the cluster centroids, the cluster label tensor)
         """
+        fp32_tensor = fp32_tensor.to("cuda:0")
         n_clusters = codebook.centroids.numel()
         fp32_tensor = fp32_tensor.view(-1)
         for k in range(n_clusters):
@@ -52,13 +54,14 @@ class KMeansQuantizer:
                 centroids: [torch.(cuda.)FloatTensor] the cluster centroids
                 labels: [torch.(cuda.)LongTensor] cluster label tensor
         """
+        fp32_tensor = fp32_tensor.to("cuda:0")
         if codebook is None:
             # get number of clusters based on the quantization precision
             n_clusters = pow(2, bitwidth)
             # use k-means to get the quantization centroids
             kmeans = KMeans(n_clusters=n_clusters, mode='euclidean', verbose=0)
-            labels = kmeans.fit_predict(fp32_tensor.view(-1, 1)).to(torch.long)
-            centroids = kmeans.centroids.to(torch.float).view(-1)
+            labels = kmeans.fit_predict(fp32_tensor.view(-1, 1)).to(torch.long).to("cuda:0")
+            centroids = kmeans.centroids.to(torch.float).view(-1).to("cuda:0")
             codebook = Codebook(centroids, labels)
 
         # decode the codebook into k-means quantized tensor for inference
@@ -225,7 +228,9 @@ class LinearQuantizer:
             quantized_weight, shifted_quantized_bias,
             input_zero_point, output_zero_point,
             input_scale, weight_scale, output_scale,
-            feature_bitwidth=feature_bitwidth, weight_bitwidth=weight_bitwidth
+            feature_bitwidth=feature_bitwidth, weight_bitwidth=weight_bitwidth,
+            fc_name=fc_name,
+            relu_name=relu_name
         )
 
     def fuse_conv_bn(self, conv, bn):
@@ -387,8 +392,8 @@ class LinearQuantizer:
 
         leye_attention_fc = model_fused_copy.leye_attention_fc
         reye_attention_fc = model_fused_copy.reye_attention_fc
-        leye_attention_fc[0] = self.get_quantized_linear(input_activation, output_activation, "leye_attention_fc.0", "leye_attention_fc.0", feature_bitwidth, leye_attention_fc[0])
-        reye_attention_fc[0] = self.get_quantized_linear(input_activation, output_activation, "reye_attention_fc.0", "reye_attention_fc.0", feature_bitwidth, reye_attention_fc[0])
+        model_fused_copy.leye_attention_fc = self.get_quantized_linear(input_activation, output_activation, "leye_attention_fc.0", "leye_attention_fc.0", feature_bitwidth, leye_attention_fc[0])
+        model_fused_copy.reye_attention_fc= self.get_quantized_linear(input_activation, output_activation, "reye_attention_fc.0", "reye_attention_fc.0", feature_bitwidth, reye_attention_fc[0])
 
 
         regressor = model_fused_copy.regressor
@@ -435,10 +440,10 @@ class QuantizedConv2d(nn.Module):
                         input_zero_point, output_zero_point,
                         input_scale, weight_scale, output_scale,
                         stride, padding, dilation, groups):
-        print("-----------")
+        # print("-----------")
         assert(len(padding) == 4)
-        print(weight.dtype, input.dtype)
-        print(bias.dtype if bias is not None else "")
+        # print("weight dtype: ", weight.dtype, "input dtype: ", input.dtype)
+        # print("bias dtype: ", bias.dtype if bias is not None else "")
 
 
         assert(weight.dtype == input.dtype)
@@ -451,8 +456,8 @@ class QuantizedConv2d(nn.Module):
 
         # Step 1: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
         input = torch.nn.functional.pad(input, padding, 'constant', input_zero_point)
-        print("input size: ", input.shape)
-        print("weight size: ", weight.shape)
+        # print("input size: ", input.shape)
+        # print("weight size: ", weight.shape)
         if 'cpu' in input.device.type:
             # use 32-b MAC for simplicity
             output = torch.nn.functional.conv2d(input.to(torch.int32), weight.to(torch.int32), None, stride, 0, dilation, groups)
@@ -469,7 +474,7 @@ class QuantizedConv2d(nn.Module):
 
         # Make sure all value lies in the bitwidth-bit range
         output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(torch.int8)
-        print("output size: ", output.shape)
+        # print("output size: ", output.shape)
         return output
 
     def forward(self, x):
@@ -485,7 +490,7 @@ class QuantizedLinear(nn.Module):
     def __init__(self, weight, bias,
                  input_zero_point, output_zero_point,
                  input_scale, weight_scale, output_scale,
-                 feature_bitwidth=8, weight_bitwidth=8):
+                 feature_bitwidth=8, weight_bitwidth=8, fc_name="", relu_name=""):
         super().__init__()
         # current version Pytorch does not support IntTensor as nn.Parameter
         self.register_buffer('weight', weight)
@@ -496,6 +501,9 @@ class QuantizedLinear(nn.Module):
 
         self.input_scale = input_scale
         self.register_buffer('weight_scale', weight_scale)
+
+        self.fc_name = fc_name
+        self.relu_name = relu_name
         self.output_scale = output_scale
 
         self.feature_bitwidth = feature_bitwidth
@@ -504,6 +512,10 @@ class QuantizedLinear(nn.Module):
     def quantized_linear(self, input, weight, bias, feature_bitwidth, weight_bitwidth,
                      input_zero_point, output_zero_point,
                      input_scale, weight_scale, output_scale):
+        
+        # print("LINEAR")
+        # print("input dtype: ", input.dtype, "weight dtype: ", weight.dtype)
+        # print(self.fc_name, self.relu_name)
         assert(input.dtype == torch.int8)
         assert(weight.dtype == input.dtype)
         assert(bias is None or bias.dtype == torch.int32)
@@ -525,7 +537,6 @@ class QuantizedLinear(nn.Module):
         # Step 2: scale the output
         #         hint: 1. scales are floating numbers, we need to convert output to float as well
         #               2. the shape of weight scale is [oc, 1, 1, 1] while the shape of output is [batch_size, oc]
-        # weight_scale = weight_scale.repeat(output.size()[0])
         weight_scale = torch.transpose(weight_scale, -1, -2)
         output = (output.to(torch.float32)) * (input_scale * weight_scale / output_scale)
 
@@ -573,8 +584,8 @@ def get_model_size(model: nn.Module, data_width=32):
     return num_elements * data_width
 
 def get_activations(args, model):
-    trainmodel = TrainModel(args=args, model=model)
-    train_dataloader = trainmodel.train_dataloader()
+    trainset = MPIIGazeDataset(args.dataset_dir, is_train=True)
+    train_dataloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     print(train_dataloader)
     input_activation = {}
     output_activation = {}
@@ -602,7 +613,7 @@ def get_activations(args, model):
     right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3])
     face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3])
 
-    model(left.cuda(), right.cuda(), face.cuda())
+    model(left, right, face)
 
     # # remove hooks
     for h in hooks:
@@ -687,72 +698,109 @@ def train(
     
 
 
+
 if __name__ == "__main__": 
-    print("loading model...")
-    model = MyModelv7(arch="proxyless-w0.3-r176_imagenet").cuda()
 
     pl.seed_everything(47)
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=False, type=str, default="./configs/config.yaml")
+    parser.add_argument('--onnx_model', default="./linear_output/gaze.onnx")
+    parser.add_argument('--onnx_model_sim',
+                        help='Output ONNX model',
+                        default="./linear_output/gaze-sim.onnx")
     args = parser.parse_args()
 
     with open(args.config) as f:
         yaml_args = yaml.load(f, Loader=yaml.FullLoader)
     yaml_args.update(vars(args))
     args = argparse.Namespace(**yaml_args)
+#     print("loading model...")
+    model = MyModelv7(arch="proxyless-w0.3-r176_imagenet")
+    checkpoint = torch.load("./ckpts_linear_quantized/last.ckpt", map_location=torch.device('cpu'))
+    state_dict = copy.deepcopy(checkpoint['state_dict'])
+    checkpoint = {}
+    for key in state_dict:
+        if key.startswith("model."):
+            checkpoint[key.replace("model.", "")] = state_dict[key]
+    model.load_state_dict(checkpoint)
 
-    model = TrainModel(args, model=model)
-    
-    # model = TrainModel(args=args, model=quantized_model, kmeans_quantizer=km)
-    mylogger = WandbLogger(project=str(args.project), 
-                                log_model=False, 
-                                entity="6-5940"
-                                
-                               )
-    mylogger.log_hyperparams(args)
-    mylogger.watch(model, None, 10000, log_graph=False)
-
-    checkpoint_callback = ModelCheckpoint(dirpath=args.ckpt_dir,
-                                        filename='{epoch}-{val_loss:.4f}-{val_angle_error:.2f}',
-                                        monitor='val_angle_error',
-                                        save_last=True,
-                                        save_top_k=3,
-                                        verbose=False)
-    
-
-    print("Starting training...")
-    trainer = Trainer(default_root_dir=args.ckpt_dir,
-                    devices=1,
-                    precision=32,
-                    callbacks=[checkpoint_callback],
-                    max_epochs=args.epoch,
-                    benchmark=True,
-                    logger=mylogger
-                    )
-    trainer.fit(model)
-    trainer.validate(model)
-
-
-    conv = []
-    for name, m in model.named_modules():
-        if isinstance(m, (nn.Linear)):
-            print(name)
-
-    # print(conv)
-    # print("fusing model...")
     l = LinearQuantizer(model, 8)
     l.fuse_model()
     print(l.model_fused)
 
 
     print("getting activations...")
-    input_activation, output_activation = get_activations(args, l.model_fused.cuda())
-    # print(input_activation.keys())
-    # print(output_activation.keys())
+    input_activation, output_activation = get_activations(args, l.model_fused)
+
     print("quantizing model...")
     l.quantize_model(input_activation, output_activation)
 
     print(l.quantized_model)
+
+    leye = torch.randn((1, 3, 60, 60))
+    reye = torch.randn((1, 3, 60, 60))
+    face = torch.randn((1, 3, 120, 120))
+
+    leye = extra_preprocess(leye)
+    reye = extra_preprocess(reye)
+    face = extra_preprocess(face)
+    dummy_input = (leye, reye, face)
+    input_names = ["left_eye", "right_eye", "face"]
+    output_names = ["gaze_pitchyaw"]
+
+    print("exporting to onnx...")
+    torch.onnx.export(l.quantized_model,
+                  dummy_input,
+                  args.onnx_model,
+                  verbose=False,
+                  input_names=input_names,
+                  output_names=output_names)
+
+
+
+
+
+
+
+#     model = TrainModel(args, model=model)
+    
+#     # model = TrainModel(args=args, model=quantized_model, kmeans_quantizer=km)
+#     mylogger = WandbLogger(project=str(args.project), 
+#                                 log_model=False, 
+#                                 entity="6-5940"
+                                
+#                                )
+#     mylogger.log_hyperparams(args)
+#     mylogger.watch(model, None, 10000, log_graph=False)
+
+#     checkpoint_callback = ModelCheckpoint(dirpath=args.ckpt_dir,
+#                                         filename='{epoch}-{val_loss:.4f}-{val_angle_error:.2f}',
+#                                         monitor='val_angle_error',
+#                                         save_last=True,
+#                                         save_top_k=3,
+#                                         verbose=False)
+    
+
+#     print("Starting training...")
+#     trainer = Trainer(default_root_dir=args.ckpt_dir,
+#                     devices=1,
+#                     precision=32,
+#                     callbacks=[checkpoint_callback],
+#                     max_epochs=args.epoch,
+#                     benchmark=True,
+#                     logger=mylogger
+#                     )
+#     trainer.fit(model)
+#     trainer.validate(model)
+
+
+#     conv = []
+#     for name, m in model.named_modules():
+#         if isinstance(m, (nn.Linear)):
+#             print(name)
+
+#     # print(conv)
+    # print("fusing model...")
 
     # model = copy.deepcopy(l.quantized_model)
 

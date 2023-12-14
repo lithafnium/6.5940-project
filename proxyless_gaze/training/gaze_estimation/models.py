@@ -114,6 +114,7 @@ class MyModelv7(nn.Module):
         right_eye_feature = right_eye_feature * right_eye_attention
         face_feature = self.face_channel(face)
         x = torch.cat([face_feature, left_eye_feature, right_eye_feature], -1)
+
         x = self.regressor(x)
         return x
 

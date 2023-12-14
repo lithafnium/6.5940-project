@@ -19,6 +19,9 @@ from tqdm import tqdm
 import models
 from dataloader import MPIIGazeDataset
 
+from quantize import KMeansQuantizer
+
+os.environ["WANDB__SERVICE_WAIT"] = "60"
 
 def euler_to_vec(theta, phi):
     x = -1 * np.cos(theta) * np.sin(phi)
@@ -72,9 +75,10 @@ class TrainModel(pl.LightningModule):
         right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3]).cuda()
         face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3]).cuda()
 
-        # left = extra_preprocess(left)
-        # right = extra_preprocess(right)
-        # face = extra_preprocess(face)
+        # if self.kmeans_quantizer is None:
+        #     left = extra_preprocess(left)
+        #     right = extra_preprocess(right)
+        #     face = extra_preprocess(face)
 
         output = self.model(left, right, face)
         loss = self.criterion(output, label)
@@ -91,15 +95,16 @@ class TrainModel(pl.LightningModule):
         right = right.expand(right.shape[0], 3, right.shape[2], right.shape[3]).cuda()
         face = face.expand(face.shape[0], 3, face.shape[2], face.shape[3]).cuda()
 
-        # left = extra_preprocess(left)
-        # right = extra_preprocess(right)
-        # face = extra_preprocess(face)
+        # if self.kmeans_quantizer is None:
+        #     left = extra_preprocess(left)
+        #     right = extra_preprocess(right)
+        #     face = extra_preprocess(face)
 
         output = self.model(left, right, face)
         loss = self.criterion(output, label)
         angle_error = np.mean(self.calc_angle_error(output, label))
-        self.log("val_loss", loss, on_epoch=True)
-        self.log("val_angle_error", angle_error, on_epoch=True, logger=True)
+        self.log("val_loss", loss, on_epoch=True, sync_dist=True)
+        self.log("val_angle_error", angle_error, on_epoch=True, logger=True, sync_dist=True)
     
     def configure_optimizers(self):
         optimizer = getattr(torch.optim, self.args.optimizer)(self.model.parameters(), **self.args.optimizer_parameters)
@@ -121,27 +126,19 @@ class TrainModel(pl.LightningModule):
         return testloader
 
 
-if __name__ == "__main__":
-    pl.seed_everything(47)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', required=False, type=str, default="./configs/config.yaml")
-    parser.add_argument('--resume', action="store_true", dest="resume")
-    args = parser.parse_args()
+def train_kmeans(model, args):
+    km = KMeansQuantizer(model, bitwidth=8) 
+    km.apply(model, update_centroids=False)
 
-    with open(args.config) as f:
-        yaml_args = yaml.load(f, Loader=yaml.FullLoader)
-    yaml_args.update(vars(args))
-    args = argparse.Namespace(**yaml_args)
-
-    model = TrainModel(args)
+    trainer_model = TrainModel(args, model=model, kmeans_quantizer=km)
 
     if args.logger == 'wandb':
         mylogger = WandbLogger(project=args.project, 
                             log_model=False, 
-                            name=args.run_name,
-                            id=args.run_name)
+                            entity="steveli",
+                            )
         mylogger.log_hyperparams(args)
-        mylogger.watch(model, None, 10000, log_graph=False)
+        mylogger.watch(trainer_model, None, 10000, log_graph=False)
     else:
         raise NotImplementedError
 
@@ -153,17 +150,72 @@ if __name__ == "__main__":
                                         verbose=False)
 
     trainer = Trainer(default_root_dir=args.ckpt_dir,
-                    gpus=-1,
+                    devices=4,
                     precision=32,
                     callbacks=[checkpoint_callback],
                     max_epochs=args.epoch,
                     benchmark=True,
-                    strategy=DDPStrategy(find_unused_parameters=False),
-                    logger=mylogger
+                    logger=mylogger,
+                    strategy=DDPStrategy(find_unused_parameters=True)
                     )
 
     if args.resume:
-        trainer.fit(model, ckpt_path=osp.join(args.ckpt_dir, "last.ckpt"))
+        trainer.fit(trainer_model, ckpt_path=osp.join(args.ckpt_dir, "last.ckpt"))
     else:
-        trainer.fit(model)
-    trainer.validate(model)
+        trainer.fit(trainer_model)
+    trainer.validate(trainer_model)
+ 
+def linear_trainer(model, args):
+    trainer_model = TrainModel(args, model=model)
+
+    if args.logger == 'wandb':
+        mylogger = WandbLogger(project="linear_quantized_gaze", 
+                            log_model=False, 
+                            entity="steveli",
+                            )
+        mylogger.log_hyperparams(args)
+        mylogger.watch(trainer_model, None, 10000, log_graph=False)
+    else:
+        raise NotImplementedError
+
+    checkpoint_callback = ModelCheckpoint(dirpath=args.ckpt_dir,
+                                        filename='{epoch}-{val_loss:.4f}-{val_angle_error:.2f}',
+                                        monitor='val_angle_error',
+                                        save_last=True,
+                                        save_top_k=3,
+                                        verbose=False)
+
+    trainer = Trainer(default_root_dir=args.ckpt_dir,
+                    devices=4,
+                    precision=32,
+                    callbacks=[checkpoint_callback],
+                    max_epochs=args.epoch,
+                    benchmark=True,
+                    logger=mylogger,
+                    strategy=DDPStrategy(find_unused_parameters=True)
+                    )
+
+    if args.resume:
+        trainer.fit(trainer_model, ckpt_path=osp.join(args.ckpt_dir, "last.ckpt"))
+    else:
+        trainer.fit(trainer_model)
+    trainer.validate(trainer_model)
+
+
+if __name__ == "__main__":
+    pl.seed_everything(47)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', required=False, type=str, default="./configs/config.yaml")
+    parser.add_argument('--resume', action="store_true", dest="resume")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        yaml_args = yaml.load(f, Loader=yaml.FullLoader)
+    yaml_args.update(vars(args))
+    args = argparse.Namespace(**yaml_args)
+    model = models.MyModelv7(arch=args.arch).cuda()
+    train_kmeans(model=model, args=args)
+
+    # linear_trainer(model=model, args=args)
+
+    

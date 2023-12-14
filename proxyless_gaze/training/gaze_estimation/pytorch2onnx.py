@@ -4,7 +4,7 @@
 
 import os
 import argparse
-from models import MyModelv7, MyModelv8
+from models import MyModelv7
 from torch.autograd import Variable
 import torch
 import onnxsim
